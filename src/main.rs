@@ -101,7 +101,7 @@ pub fn pure_search(
             .par_iter()
             .map(
                 move |path| -> Result<Vec<(String, String)>, OmaContentsError> {
-                    pure_search_contents_from_path(path, searcher.clone(), &query, &count, mode)
+                    pure_search_contents_from_path(path, &searcher, &query, &count, mode)
                 },
             )
             .collect::<Result<Vec<_>, OmaContentsError>>()
@@ -124,7 +124,7 @@ pub fn pure_search(
 
 fn pure_search_contents_from_path(
     path: &Path,
-    searcher: AhoCorasick,
+    searcher: &AhoCorasick,
     query: &str,
     count: &AtomicUsize,
     mode: Mode,
