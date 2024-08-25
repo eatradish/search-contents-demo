@@ -1,15 +1,11 @@
 use std::{
-    env::args,
-    fs,
-    io::{BufRead, BufReader, Read, Seek},
-    path::{Path, PathBuf},
-    sync::{
+    collections::HashSet, env::args, fs, io::{BufRead, BufReader, Read, Seek}, path::{Path, PathBuf}, sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
-    },
-    thread,
+    }, thread
 };
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use flate2::bufread::GzDecoder;
 use lzzzz::lz4f::BufReadDecompressor;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -71,6 +67,8 @@ pub enum OmaContentsError {
     FailedToGetFileMetadata(String, std::io::Error),
     #[error("Failed to wait ripgrep to exit: {0}")]
     FailedToWaitExit(std::io::Error),
+    #[error("Failed to build Aho-Corasick tree: {0}")]
+    FailedToBuildAhoCorasick(#[from] aho_corasick::BuildError),
     #[error("Contents entry missing path list: {0}")]
     ContentsEntryMissingPathList(String),
     #[error("Command not found wrong argument")]
@@ -93,16 +91,17 @@ pub fn pure_search(
 ) -> Result<Vec<(String, String)>, OmaContentsError> {
     let paths = mode.paths(path.as_ref())?;
     let count = Arc::new(AtomicUsize::new(0));
-    let count_clone = count.clone();
+    let count_local = count.clone();
 
-    let query = Arc::from(query);
+    let searcher = AhoCorasickBuilder::new().build(&[query])?;
+    let query = query.to_string();
 
     let worker = thread::spawn(move || {
         paths
             .par_iter()
             .map(
                 move |path| -> Result<Vec<(String, String)>, OmaContentsError> {
-                    pure_search_contents_from_path(path, &query, count.clone(), mode)
+                    pure_search_contents_from_path(path, &searcher, &query, &count, mode)
                 },
             )
             .collect::<Result<Vec<_>, OmaContentsError>>()
@@ -111,7 +110,7 @@ pub fn pure_search(
 
     let mut tmp = 0;
     loop {
-        let count = count_clone.load(Ordering::SeqCst);
+        let count = count_local.load(Ordering::Acquire);
         if count > 0 && count != tmp {
             cb(count);
             tmp = count;
@@ -125,8 +124,9 @@ pub fn pure_search(
 
 fn pure_search_contents_from_path(
     path: &Path,
+    searcher: &AhoCorasick,
     query: &str,
-    count: Arc<AtomicUsize>,
+    count: &AtomicUsize,
     mode: Mode,
 ) -> Result<Vec<(String, String)>, OmaContentsError> {
     let mut f = fs::File::open(path)
@@ -162,14 +162,14 @@ fn pure_search_contents_from_path(
 
     let reader = BufReader::new(contents_reader);
 
-    let cb = match mode {
-        Mode::Provides => |_pkg: &str, file: &str, query: &str| file.contains(query),
-        Mode::Files => |pkg: &str, _file: &str, query: &str| pkg == query,
-        Mode::BinProvides => |_pkg: &str, file: &str, query: &str| {
-            file.contains(query) && file.starts_with(BIN_PREFIX)
-        },
+    let cb: Box<dyn Fn(&str, &str, &str) -> bool> = match mode {
+        Mode::Provides => Box::new(|_pkg: &str, file: &str, _: &str| searcher.is_match(file)),
+        Mode::Files => Box::new(|pkg: &str, _file: &str, query: &str| pkg == query),
+        Mode::BinProvides => Box::new(|_pkg: &str, file: &str, _: &str| {
+            file.starts_with(BIN_PREFIX) && searcher.is_match(file)
+        }),
         Mode::BinFiles => {
-            |pkg: &str, file: &str, query: &str| pkg == query && file.starts_with(BIN_PREFIX)
+            Box::new(|pkg: &str, file: &str, query: &str| pkg == query && file.starts_with(BIN_PREFIX))
         }
     };
 
@@ -181,10 +181,10 @@ fn pure_search_contents_from_path(
 fn pure_search_foreach_result(
     cb: impl Fn(&str, &str, &str) -> bool,
     reader: BufReader<&mut dyn Read>,
-    count: Arc<AtomicUsize>,
+    count: &AtomicUsize,
     query: &str,
 ) -> Vec<(String, String)> {
-    let mut res = vec![];
+    let mut res = HashSet::new();
 
     for i in reader.lines() {
         let i = match i {
@@ -199,16 +199,16 @@ fn pure_search_foreach_result(
 
         for (_, pkg) in pkgs {
             if cb(pkg, file, query) {
-                count.fetch_add(1, Ordering::SeqCst);
+                count.fetch_add(1, Ordering::AcqRel);
                 let line = (pkg.to_string(), prefix(file));
                 if !res.contains(&line) {
-                    res.push(line);
+                    res.insert(line);
                 }
             }
         }
     }
 
-    res
+    res.into_iter().collect()
 }
 
 #[inline]
